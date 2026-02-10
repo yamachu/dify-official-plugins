@@ -63,6 +63,17 @@ parameters:
     default: 3
     min: 1
     max: 30
+  - name: mcp_json_config
+    type: string
+    required: false
+    label:
+      en_US: MCP JSON Configuration
+      zh_Hans: MCP JSON 配置
+      pt_BR: MCP JSON Configuration
+    placeholder:
+      en_US: 'Paste MCP server config (e.g., {"web-search": {"url": "http://localhost:8000", "transport": "sse"}, "db": {"url": "http://db:5000", "transport": "streamable_http", "auth_token": "token"}}). Leave empty to disable.'
+      zh_Hans: 'MCP服务器配置（例 {"web-search": {"url": "http://localhost:8000", "transport": "sse"}, "db": {"url": "http://db:5000", "transport": "streamable_http", "auth_token": "token"}}）。留空禁用。'
+      pt_BR: 'Paste MCP server config (e.g., {"web-search": {"url": "http://localhost:8000", "transport": "sse"}, "db": {"url": "http://db:5000", "transport": "streamable_http", "auth_token": "token"}}). Leave empty to disable.'
 extra:
   python:
     source: strategies/ReAct.py
