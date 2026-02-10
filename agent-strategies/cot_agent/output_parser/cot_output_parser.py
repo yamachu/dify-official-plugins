@@ -227,3 +227,95 @@ class CotAgentOutputParser:
                 yield parsed_result
             else:
                 yield ReactChunk(cur_state, json_cache)
+
+
+class MCPStreamHandler:
+    """
+    Handler for parsing MCP streaming responses.
+    
+    MCP servers can respond with:
+    1. SSE (Server-Sent Events) format: newline-delimited JSON events
+    2. Chunked JSON: streaming JSON objects/text
+    
+    This handler normalizes both formats into text output compatible with
+    ReAct observation processing.
+    """
+    
+    @staticmethod
+    def parse_sse_stream(stream: Generator[str, None, None]) -> Generator[str, None, None]:
+        """
+        Parse Server-Sent Events (SSE) format from MCP server.
+        
+        Expected format:
+            data: {"text": "partial output"}
+            data: {"text": "more output"}
+        
+        Args:
+            stream: Generator yielding SSE-formatted lines.
+            
+        Yields:
+            Parsed text chunks from the SSE stream.
+        """
+        for line in stream:
+            line = line.strip()
+            if not line or line.startswith(":"):
+                continue
+            
+            if line.startswith("data:"):
+                data_str = line[5:].strip()
+                try:
+                    data = json.loads(data_str)
+                    if isinstance(data, dict):
+                        # Extract text from common field names
+                        if "text" in data:
+                            yield data["text"]
+                        elif "content" in data:
+                            yield data["content"]
+                        elif "message" in data:
+                            yield data["message"]
+                        else:
+                            yield json.dumps(data)
+                    else:
+                        yield str(data)
+                except json.JSONDecodeError:
+                    # Fallback: yield raw data if not JSON
+                    yield data_str
+    
+    @staticmethod
+    def parse_chunked_json_stream(stream: Generator[str, None, None]) -> Generator[str, None, None]:
+        """
+        Parse chunked JSON stream from MCP server.
+        
+        Expected format: newline-delimited JSON objects
+            {"text": "partial"}
+            {"text": "output"}
+        
+        Args:
+            stream: Generator yielding newline-delimited JSON.
+            
+        Yields:
+            Parsed text chunks from the JSON stream.
+        """
+        for line in stream:
+            line = line.strip()
+            if not line:
+                continue
+            
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict):
+                    # Extract text from common field names
+                    if "text" in data:
+                        yield data["text"]
+                    elif "content" in data:
+                        yield data["content"]
+                    elif "message" in data:
+                        yield data["message"]
+                    else:
+                        yield json.dumps(data)
+                else:
+                    yield str(data)
+            except json.JSONDecodeError:
+                # Fallback: yield raw line if not JSON
+                yield line
+

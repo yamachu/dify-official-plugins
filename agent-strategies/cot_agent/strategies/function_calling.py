@@ -1,5 +1,6 @@
 import json
 import time
+import logging
 from collections.abc import Generator
 from copy import deepcopy
 from typing import Any, Optional, cast
@@ -28,6 +29,10 @@ from dify_plugin.interfaces.agent import (
     ToolInvokeMeta,
 )
 from pydantic import BaseModel
+
+from mcp_client import MCPClient, MCPConfigError
+
+logger = logging.getLogger(__name__)
 
 class LogMetadata:
     """Metadata keys for logging"""
@@ -88,6 +93,7 @@ class FunctionCallingParams(BaseModel):
     tools: list[ToolEntity] | None
     maximum_iterations: int = 3
     context: list[ContextItem] | None = None
+    mcp_json_config: str | None = None
 
 
 class FunctionCallingAgentStrategy(AgentStrategy):
@@ -118,9 +124,26 @@ class FunctionCallingAgentStrategy(AgentStrategy):
         history_prompt_messages.insert(0, self._system_prompt_message)
         history_prompt_messages.append(self._user_prompt_message)
 
-        # convert tool messages
+        # convert tool messages and init MCP
         tools = fc_params.tools
         tool_instances = {tool.identity.name: tool for tool in tools} if tools else {}
+        mcp_client = None
+        mcp_tool_map: dict[str, tuple[str, str]] = {}  # prefixed_tool_name -> (server_name, tool_name)
+        
+        # Initialize MCP client if configured
+        try:
+            if fc_params.mcp_json_config:
+                mcp_client = MCPClient(fc_params.mcp_json_config)
+                if mcp_client.enabled:
+                    mcp_tools = mcp_client.discover_tools()
+                    # Note: MCP tool discovery is a placeholder for now
+                    # When actual MCP protocol support is added, tool_instances will be extended
+                    mcp_tool_map = mcp_client.tool_name_map
+        except MCPConfigError as e:
+            # Hard error on invalid MCP config
+            logger.error(f"MCP configuration error: {e}")
+            raise ValueError(f"Invalid MCP JSON configuration: {e}") from e
+        
         prompt_messages_tools = self._init_prompt_tools(tools)
 
         # init model parameters
@@ -395,6 +418,46 @@ class FunctionCallingAgentStrategy(AgentStrategy):
                     )
             else:
                 for tool_call_id, tool_call_name, tool_call_args in tool_calls:
+                    # Check if this is an MCP tool
+                    is_mcp_tool = tool_call_name in mcp_tool_map
+                    
+                    if is_mcp_tool:
+                        if mcp_client is None:
+                            tool_response = {
+                                "tool_call_id": tool_call_id,
+                                "tool_call_name": tool_call_name,
+                                "tool_response": "MCP client is not initialized.",
+                                "meta": ToolInvokeMeta.error_instance(
+                                    "MCP client is not initialized."
+                                ).to_dict(),
+                            }
+                            tool_responses.append(tool_response)
+                            current_thoughts.append(
+                                ToolPromptMessage(
+                                    content=tool_response["tool_response"],
+                                    tool_call_id=tool_call_id,
+                                    name=tool_call_name,
+                                )
+                            )
+                            continue
+
+                        # Invoke MCP tool
+                        tool_response = yield from self._invoke_mcp_tool(
+                            mcp_client=mcp_client,
+                            tool_call_id=tool_call_id,
+                            tool_call_name=tool_call_name,
+                            tool_call_args=tool_call_args,
+                            round_log=round_log,
+                        )
+                        current_thoughts.append(
+                            ToolPromptMessage(
+                                content=tool_response["tool_response"],
+                                tool_call_id=tool_call_id,
+                                name=tool_call_name,
+                            )
+                        )
+                        continue
+
                     tool_instance = tool_instances[tool_call_name]
                     tool_call_started_at = time.perf_counter()
                     tool_call_log = self.create_log_message(
@@ -621,6 +684,73 @@ class FunctionCallingAgentStrategy(AgentStrategy):
                 "execution_metadata": metadata.model_dump()
             }
         )
+        
+        # Cleanup MCP client
+        if mcp_client is not None:
+            try:
+                mcp_client.close()
+            except Exception as e:
+                logger.warning(f"Error closing MCP client: {e}")
+
+    def _invoke_mcp_tool(
+        self,
+        mcp_client: MCPClient,
+        tool_call_id: str,
+        tool_call_name: str,
+        tool_call_args: dict[str, Any],
+        round_log: ToolInvokeMessage.LogMessage,
+    ) -> Generator[AgentInvokeMessage, None, dict[str, Any]]:
+        tool_call_started_at = time.perf_counter()
+        tool_call_log = self.create_log_message(
+            label=f"CALL {tool_call_name}",
+            data={},
+            metadata={
+                LogMetadata.STARTED_AT: time.perf_counter(),
+                LogMetadata.PROVIDER: "mcp",
+            },
+            parent=round_log,
+            status=ToolInvokeMessage.LogMessage.LogStatus.START,
+        )
+        yield tool_call_log
+
+        try:
+            tool_result = ""
+            for chunk in mcp_client.invoke_tool(tool_call_name, tool_call_args):
+                # MCP returns dict chunks that need to be converted to text results
+                if isinstance(chunk, dict):
+                    if "text" in chunk:
+                        tool_result += chunk.get("text", "")
+                    else:
+                        tool_result += json.dumps(chunk, ensure_ascii=False)
+                else:
+                    tool_result += str(chunk)
+
+            tool_response = {
+                "tool_call_id": tool_call_id,
+                "tool_call_name": tool_call_name,
+                "tool_call_input": tool_call_args,
+                "tool_response": tool_result if tool_result else "Tool executed successfully",
+            }
+        except Exception as e:
+            tool_result = f"MCP tool invocation error: {e!s}"
+            tool_response = {
+                "tool_call_id": tool_call_id,
+                "tool_call_name": tool_call_name,
+                "tool_response": tool_result,
+            }
+
+        yield self.finish_log_message(
+            log=tool_call_log,
+            data={"output": tool_response},
+            metadata={
+                LogMetadata.STARTED_AT: tool_call_started_at,
+                LogMetadata.PROVIDER: "mcp",
+                LogMetadata.FINISHED_AT: time.perf_counter(),
+                LogMetadata.ELAPSED_TIME: time.perf_counter() - tool_call_started_at,
+            },
+        )
+
+        return tool_response
 
     def check_tool_calls(self, llm_result_chunk: LLMResultChunk) -> bool:
         """

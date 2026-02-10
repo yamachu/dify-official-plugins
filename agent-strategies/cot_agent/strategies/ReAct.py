@@ -1,5 +1,6 @@
 import json
 import time
+import logging
 from collections.abc import Generator, Mapping
 from typing import Any, Optional, cast
 
@@ -26,7 +27,10 @@ from dify_plugin.interfaces.agent import (
 )
 from output_parser.cot_output_parser import ReactChunk, ReactState, CotAgentOutputParser
 from prompt.template import REACT_PROMPT_TEMPLATES
+from mcp_client import MCPClient, MCPConfigError
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 class LogMetadata:
     """Metadata keys for logging"""
@@ -54,6 +58,7 @@ class ReActParams(BaseModel):
     tools: list[ToolEntity] | None
     maximum_iterations: int = 3
     context: list[ContextItem] | None = None
+    mcp_json_config: str | None = None
 
 
 class AgentPromptEntity(BaseModel):
@@ -139,9 +144,26 @@ class ReActAgentStrategy(AgentStrategy):
         # Init prompts
         self.history_prompt_messages = model.history_prompt_messages
 
-        # convert tools into ModelRuntime Tool format
+        # convert tools into ModelRuntime Tool format and init MCP
         tools = react_params.tools
         tool_instances = {tool.identity.name: tool for tool in tools} if tools else {}
+        mcp_client = None
+        mcp_tool_map: dict[str, tuple[str, str]] = {}  # prefixed_tool_name -> (server_name, tool_name)
+        
+        # Initialize MCP client if configured
+        try:
+            if react_params.mcp_json_config:
+                mcp_client = MCPClient(react_params.mcp_json_config)
+                if mcp_client.enabled:
+                    mcp_tools = mcp_client.discover_tools()
+                    # Note: MCP tool discovery is a placeholder for now
+                    # When actual MCP protocol support is added, tool_instances will be extended
+                    mcp_tool_map = mcp_client.tool_name_map
+        except MCPConfigError as e:
+            # Hard error on invalid MCP config
+            logger.error(f"MCP configuration error: {e}")
+            raise ValueError(f"Invalid MCP JSON configuration: {e}") from e
+        
         react_params.model.completion_params = (
             react_params.model.completion_params or {}
         )
@@ -359,6 +381,8 @@ class ReActAgentStrategy(AgentStrategy):
                             action=scratchpad.action,
                             tool_instances=tool_instances,
                             message_file_ids=message_file_ids,
+                            mcp_client=mcp_client,
+                            mcp_tool_map=mcp_tool_map,
                         )
                         scratchpad.observation = tool_invoke_response
                         scratchpad.agent_response = tool_invoke_response
@@ -418,6 +442,13 @@ class ReActAgentStrategy(AgentStrategy):
                 },
             )
             iteration_step += 1
+
+        # Cleanup MCP client
+        if mcp_client is not None:
+            try:
+                mcp_client.close()
+            except Exception as e:
+                logger.warning(f"Error closing MCP client: {e}")
 
         # yield self.create_text_message(final_answer)
 
@@ -531,18 +562,28 @@ class ReActAgentStrategy(AgentStrategy):
         action: AgentScratchpadUnit.Action,
         tool_instances: Mapping[str, ToolEntity],
         message_file_ids: list[str],
+        mcp_client: Optional[MCPClient] = None,
+        mcp_tool_map: Optional[dict[str, tuple[str, str]]] = None,
     ) -> tuple[str, dict[str, Any] | str, list[ToolInvokeMessage]]:
         """
         handle invoke action
         :param action: action
         :param tool_instances: tool instances
         :param message_file_ids: message file ids
-        :param trace_manager: trace manager
+        :param mcp_client: MCP client instance
+        :param mcp_tool_map: MCP tool name mapping
         :return: observation, meta
         """
         # action is tool call, invoke tool
         tool_call_name = action.action_name
         tool_call_args = action.action_input
+
+        # Check if this is an MCP tool
+        is_mcp_tool = mcp_tool_map and tool_call_name in mcp_tool_map
+        
+        if is_mcp_tool and mcp_client:
+            return self._invoke_mcp_tool_react(mcp_client, tool_call_name, tool_call_args)
+        
         tool_instance = tool_instances.get(tool_call_name)
 
         if not tool_instance:
@@ -613,6 +654,39 @@ class ReActAgentStrategy(AgentStrategy):
             additional_messages = []
 
         return result, tool_invoke_parameters, additional_messages
+
+    def _invoke_mcp_tool_react(
+        self,
+        mcp_client: MCPClient,
+        tool_call_name: str,
+        tool_call_args: dict[str, Any] | str,
+    ) -> tuple[str, dict[str, Any] | str, list[ToolInvokeMessage]]:
+        """Handle MCP tool invocation for ReAct strategy"""
+        if isinstance(tool_call_args, str):
+            try:
+                tool_call_args = json.loads(tool_call_args)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse MCP tool arguments: {e}")
+                return f"MCP tool invocation error: invalid JSON arguments", tool_call_args, []
+        
+        tool_call_args = cast(dict[str, Any], tool_call_args)
+        try:
+            result = ""
+            additional_messages = []
+            for chunk in mcp_client.invoke_tool(tool_call_name, tool_call_args):
+                # MCP returns dict chunks that need to be converted to text results
+                if isinstance(chunk, dict):
+                    if "text" in chunk:
+                        result += chunk.get("text", "")
+                    else:
+                        result += json.dumps(chunk, ensure_ascii=False)
+                else:
+                    result += str(chunk)
+            
+            return result if result else "MCP tool executed successfully", tool_call_args, additional_messages
+        except Exception as e:
+            result = f"MCP tool invocation error: {e!s}"
+            return result, tool_call_args, []
 
     def _convert_dict_to_action(self, action: dict) -> AgentScratchpadUnit.Action:
         """
