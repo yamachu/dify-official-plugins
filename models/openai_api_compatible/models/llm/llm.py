@@ -1,7 +1,10 @@
+import json
 import re
 from contextlib import suppress
-from typing import Mapping, Optional, Union, Generator
+from typing import Mapping, Optional, Union, Generator, List
+from urllib.parse import urljoin
 
+import requests
 from dify_plugin.entities.model import (
     AIModelEntity,
     DefaultParameterName,
@@ -10,7 +13,7 @@ from dify_plugin.entities.model import (
     ParameterRule,
     ParameterType,
 )
-from dify_plugin.entities.model.llm import LLMResult
+from dify_plugin.entities.model.llm import LLMMode, LLMResult
 from dify_plugin.entities.model.message import (
     PromptMessage,
     PromptMessageRole,
@@ -18,13 +21,201 @@ from dify_plugin.entities.model.message import (
     SystemPromptMessage,
     AssistantPromptMessage,
 )
+from dify_plugin.errors.model import CredentialsValidateFailedError
 from dify_plugin.interfaces.model.openai_compatible.llm import OAICompatLargeLanguageModel
-from typing import List
+
+from openai import OpenAI
 
 
 class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
     # Pre-compiled regex for better performance
     _THINK_PATTERN = re.compile(r"^<think>.*?</think>\s*", re.DOTALL)
+    # Models that require max_completion_tokens (OpenAI Responses API family)
+    _NEEDS_MAX_COMPLETION_TOKENS_PATTERN = re.compile(r"^(o1|o3|gpt-5)", re.IGNORECASE)
+
+    def _wrap_thinking_by_reasoning_content(self, delta: dict, is_reasoning: bool) -> tuple[str, bool]:
+        """
+        Override base wrapper to support both legacy 'reasoning_content' and
+        newer 'reasoning' fields (e.g., vLLM >= 0.17.1), emitting <think> blocks
+        compatible with Dify's downstream filters.
+        """
+        # Prefer the new key when present, otherwise fall back to legacy
+        reasoning_piece = delta.get("reasoning") or delta.get("reasoning_content")
+        content_piece = delta.get("content") or ""
+
+        if reasoning_piece:
+            if not is_reasoning:
+                # Open a think block on first reasoning token
+                output = f"<think>\n{reasoning_piece}"
+                is_reasoning = True
+            else:
+                # Continue streaming inside the think block
+                output = str(reasoning_piece)
+        elif is_reasoning:
+            # No reasoning token in this delta, close the think block
+            is_reasoning = False
+            output = f"\n</think>{content_piece}"
+        else:
+            # No reasoning token and not in a reasoning block
+            output = content_piece
+
+        return output, is_reasoning
+
+    # Timeout for validation requests: (connect_timeout, read_timeout) in seconds
+    _VALIDATE_TIMEOUT = (10, 300)
+
+    @staticmethod
+    def _needs_max_completion_tokens(m: str) -> bool:
+        return bool(OpenAILargeLanguageModel._NEEDS_MAX_COMPLETION_TOKENS_PATTERN.match(m))
+
+    @staticmethod
+    def _raise_credentials_error(response: requests.Response) -> None:
+        """Raise a CredentialsValidateFailedError with response details."""
+        raise CredentialsValidateFailedError(
+            f"Credentials validation failed with status code {response.status_code} "
+            f"and response body {response.text}"
+        )
+
+    def validate_credentials(self, model: str, credentials: dict) -> None:
+        """Validate credentials with fallback handling for multiple error scenarios.
+
+        1) Try base validation first (keeps upstream compatibility).
+        2) If it fails due to too-small token floor on Responses API
+           (e.g., "Invalid 'max_output_tokens' ... integer_below_min_value"),
+           retry once with a safe minimum of 16 using the appropriate endpoint/param.
+        3) If it fails due to thinking/budget_tokens requirements
+           (e.g., Poe API requiring budget_tokens for Claude models),
+           retry with thinking explicitly disabled.
+        """
+        # When max_completion_tokens is explicitly requested, validate directly
+        # instead of letting the base class fail with max_tokens first.
+        param_pref = credentials.get("token_param_name", "auto")
+        endpoint_model = credentials.get("endpoint_model_name") or model
+        if (
+            param_pref == "max_completion_tokens"
+            or (param_pref == "auto" and self._needs_max_completion_tokens(endpoint_model))
+        ):
+            self._retry_with_safe_min_tokens(model, credentials)
+            return
+
+        try:
+            return super().validate_credentials(model, credentials)
+        except CredentialsValidateFailedError as e:
+            msg = str(e)
+
+            # --- Retry path 1: token parameter incompatibility ---
+            should_retry_floor = (
+                "Invalid 'max_output_tokens'" in msg
+                or "integer_below_min_value" in msg
+            )
+            if should_retry_floor:
+                self._retry_with_safe_min_tokens(model, credentials)
+                return
+
+            # --- Retry path 2: thinking / budget_tokens constraints ---
+            should_retry_thinking = (
+                "budget_tokens" in msg or "thinking" in msg
+            )
+            if should_retry_thinking:
+                self._retry_with_thinking_disabled(model, credentials)
+                return
+
+            # Propagate unrelated validation errors
+            raise
+
+    def _retry_with_safe_min_tokens(self, model: str, credentials: dict) -> None:
+        """Retry validation with a safe minimum token count for Responses API."""
+        endpoint_url = credentials.get("endpoint_url")
+        if not endpoint_url:
+            raise CredentialsValidateFailedError("Missing endpoint_url in credentials")
+
+        api_key = credentials.get("api_key")
+        extra_headers = credentials.get("extra_headers") or {}
+        client = OpenAI(api_key=api_key, base_url=endpoint_url, default_headers=extra_headers)
+
+        endpoint_model = credentials.get("endpoint_model_name") or model
+        mode = credentials.get("mode", "chat")
+
+        param_pref = credentials.get("token_param_name", "auto")
+        use_max_completion = (
+            param_pref == "max_completion_tokens"
+            or (param_pref == "auto" and self._needs_max_completion_tokens(endpoint_model))
+        )
+
+        SAFE_MIN_TOKENS = 16
+
+        try:
+            if mode == "chat":
+                if use_max_completion:
+                    client.chat.completions.create(
+                        model=endpoint_model,
+                        messages=[{"role": "user", "content": "ping"}],
+                        max_completion_tokens=SAFE_MIN_TOKENS,
+                        stream=False,
+                    )
+                else:
+                    client.chat.completions.create(
+                        model=endpoint_model,
+                        messages=[{"role": "user", "content": "ping"}],
+                        max_tokens=SAFE_MIN_TOKENS,
+                        stream=False,
+                    )
+            else:
+                client.completions.create(
+                    model=endpoint_model,
+                    prompt="ping",
+                    max_tokens=SAFE_MIN_TOKENS,
+                    stream=False,
+                )
+        except Exception as sub_e:
+            raise CredentialsValidateFailedError(str(sub_e)) from sub_e
+
+    def _retry_with_thinking_disabled(self, model: str, credentials: dict) -> None:
+        """Retry validation with thinking explicitly disabled for APIs
+        that enforce thinking-mode parameters (e.g., Poe API)."""
+        headers = {"Content-Type": "application/json"}
+
+        api_key = credentials.get("api_key")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        endpoint_url = credentials["endpoint_url"]
+        if not endpoint_url.endswith("/"):
+            endpoint_url += "/"
+
+        # The `or 5` fallback handles cases where the credential value is set
+        # but empty (e.g., "" or None from user input).
+        validate_max_tokens = int(credentials.get("validate_credentials_max_tokens", 5) or 5)
+        data: dict = {
+            "model": credentials.get("endpoint_model_name", model),
+            "max_tokens": validate_max_tokens,
+            "thinking": {"type": "disabled"},
+        }
+
+        completion_type = LLMMode.value_of(credentials["mode"])
+
+        if completion_type is LLMMode.CHAT:
+            data["messages"] = [{"role": "user", "content": "ping"}]
+            endpoint_url = urljoin(endpoint_url, "chat/completions")
+        elif completion_type is LLMMode.COMPLETION:
+            data["prompt"] = "ping"
+            endpoint_url = urljoin(endpoint_url, "completions")
+        else:
+            raise ValueError("Unsupported completion type for model configuration.")
+
+        try:
+            response = requests.post(
+                endpoint_url, headers=headers, json=data,
+                timeout=self._VALIDATE_TIMEOUT,
+            )
+            if response.status_code != 200:
+                self._raise_credentials_error(response)
+        except CredentialsValidateFailedError:
+            raise
+        except Exception as ex:
+            raise CredentialsValidateFailedError(
+                f"An error occurred during credentials validation: {ex!s}"
+            ) from ex
 
     def get_customizable_model_schema(
         self, model: str, credentials: Mapping | dict
@@ -240,6 +431,22 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
         # Remove thinking content from assistant messages for better performance.
         with suppress(Exception):
             self._drop_analyze_channel(prompt_messages)
+
+        # Map token parameter name when needed (Responses API style)
+        param_pref = credentials.get("token_param_name", "auto")
+
+        def _needs_max_completion_tokens(m: str) -> bool:
+            return bool(re.match(r"^(o1|o3|gpt-5)", m, re.IGNORECASE))
+
+        use_max_completion = (
+            (param_pref == "max_completion_tokens")
+            or (param_pref == "auto" and _needs_max_completion_tokens(model))
+        )
+
+        if use_max_completion:
+            # Only map if caller didn't already provide max_completion_tokens
+            if "max_completion_tokens" not in model_parameters and "max_tokens" in model_parameters:
+                model_parameters["max_completion_tokens"] = model_parameters.pop("max_tokens")
 
         result = super()._invoke(
             model, credentials, prompt_messages, model_parameters, tools, stop, stream, user
