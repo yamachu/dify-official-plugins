@@ -1,5 +1,5 @@
-# https://ai.google.dev/gemini-api/docs/models/gemini-3-pro-image-preview
-model: gemini-3-pro-image-preview
+# https://ai.google.dev/gemini-api/docs/models/gemini-3-pro-image
+model: gemini-3-pro-image
 label:
   en_US: Nano Banana Pro
 model_type: llm
@@ -108,7 +108,7 @@ parameter_rules:
       zh_Hans: 使用 Gemini Flex 服务层级（约半价、尽力而为型延迟）。详见 https://ai.google.dev/gemini-api/docs/flex-inference?hl=zh-cn
   - name: json_schema
     use_template: json_schema
-# https://ai.google.dev/gemini-api/docs/pricing#gemini-3-pro-image-preview
+# https://ai.google.dev/gemini-api/docs/pricing#gemini-3-pro-image
 pricing:
   # Image input is set at 560 tokens or $0.0011 per image.
   # Image output is priced at $120 per 1,000,000 tokens.
