@@ -43,7 +43,7 @@ file_cache = FileCache()
 
 _MMC = TypeVar("_MMC", bound=MultiModalPromptMessageContent)
 
-IMAGE_GENERATION_MODELS = {"gemini-2.5-flash-image", "gemini-3-pro-image-preview"}
+IMAGE_GENERATION_MODELS = {"gemini-2.5-flash-image", "gemini-3-pro-image"}
 
 # https://ai.google.dev/gemini-api/docs/thought-signatures#faqs
 DEFAULT_THOUGHT_SIGNATURE: bytes = b"skip_thought_signature_validator"
